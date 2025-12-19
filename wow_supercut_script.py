@@ -4,185 +4,178 @@ import os
 import subprocess
 import sys
 import tempfile
+import re
+import shutil
+import signal
+import logging
 from pathlib import Path
-import importlib.util
+from concurrent.futures import ThreadPoolExecutor
+
+# -------------------- yt-dlp Silent Logger --------------------
+class QuietLogger:
+    def debug(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
 
 # -------------------- Virtualenv Setup --------------------
-def create_venv(venv_path: Path, debug=False):
+def create_venv(venv_path: Path):
     import venv
-
     python_bin = venv_path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     pip_bin = venv_path / ("Scripts/pip.exe" if os.name == "nt" else "bin/pip")
 
-    # Check if venv exists and dependencies are installed
-    all_installed = True
-    required_packages = [
-        "faster_whisper", "ffmpeg-python", "tqdm", "yt-dlp",
-        "rapidfuzz", "av", "ctranslate2", "huggingface-hub"
-    ]
-    for pkg in required_packages:
-        if importlib.util.find_spec(pkg) is None:
-            all_installed = False
-            break
+    if sys.prefix == str(venv_path.resolve()):
+        return
 
-    if venv_path.exists() and all_installed:
-        return  # Dependencies already installed
+    required = ["faster_whisper", "ffmpeg-python", "tqdm", "yt-dlp", "rapidfuzz", "rich"]
 
     if not venv_path.exists():
-        print("[*] Creating virtual environment...")
+        print(f"[*] Creating high-quality environment in {venv_path}...")
         venv.create(venv_path, with_pip=True)
+        subprocess.check_call([str(pip_bin), "install", "-U", "pip"], stdout=subprocess.DEVNULL)
+        subprocess.check_call([str(pip_bin), "install"] + required, stdout=subprocess.DEVNULL)
 
-    # Upgrade pip
-    print("[*] Upgrading pip...")
-    pip_cmd = [str(pip_bin), "install", "--upgrade", "pip"]
-    if not debug:
-        pip_cmd.append("--quiet")
-    subprocess.check_call(pip_cmd)
+    os.execv(str(python_bin), [str(python_bin)] + sys.argv)
 
-    # Install dependencies
-    print("[*] Installing dependencies...")
-    pip_cmd = [str(pip_bin), "install"] + required_packages
-    if not debug:
-        pip_cmd.append("--quiet")
-    subprocess.check_call(pip_cmd)
+# -------------------- Main Logic --------------------
+def main():
+    import ffmpeg
+    from yt_dlp import YoutubeDL
+    from faster_whisper import WhisperModel
+    from tqdm import tqdm
+    from rapidfuzz import fuzz
+    from rich.console import Console
+    from rich.table import Table
 
-    # Relaunch inside venv only if not already running inside it
-    if sys.prefix != str(venv_path):
-        print("[*] Relaunching inside virtual environment...")
-        os.execv(str(python_bin), [str(python_bin)] + sys.argv)
+    console = Console()
 
-# -------------------- Main --------------------
-DEBUG_MODE = "--debug" in sys.argv
-create_venv(Path("./wow_env"), debug=DEBUG_MODE)
+    parser = argparse.ArgumentParser(description="High-Quality AI Supercut Tool")
+    parser.add_argument("video", help="URL or local path")
+    parser.add_argument("output", help="Output path")
+    parser.add_argument("--word", required=True, help="Word to find")
+    parser.add_argument("--before", type=float, default=0.5)
+    parser.add_argument("--after", type=float, default=0.5)
+    parser.add_argument("--model", default="medium")
+    parser.add_argument("--threads", type=int, default=os.cpu_count())
+    parser.add_argument("--debug", action="store_true", help="Show all logs/warnings")
+    args = parser.parse_args()
 
-# -------------------- Imports after venv --------------------
-import ffmpeg
-from yt_dlp import YoutubeDL
-from faster_whisper import WhisperModel
-from tqdm import tqdm
-from rapidfuzz import fuzz
-
-# -------------------- Argument Parsing --------------------
-parser = argparse.ArgumentParser(description="Supercut videos based on word matches")
-parser.add_argument("video", help="YouTube URL or local video file")
-parser.add_argument("output", help="Output video file path")
-parser.add_argument("--word", required=True, help="Word to detect in audio")
-parser.add_argument("--before", type=float, default=1, help="Seconds before word to include")
-parser.add_argument("--after", type=float, default=1, help="Seconds after word to include")
-parser.add_argument("--model", default="medium", help="Whisper model size")
-parser.add_argument("--device", default="cpu", choices=["cpu","cuda"], help="Device for transcription")
-parser.add_argument("--debug", action="store_true", help="Show full logs")
-args = parser.parse_args()
-
-LOGLEVEL = "info" if args.debug else "quiet"
-
-# -------------------- YouTube Download --------------------
-def download_video(url):
-    if os.path.exists(url):
-        return url
-    print("[*] Downloading video...")
-    ydl_opts = {
-        "format": "best",
-        "quiet": not args.debug,
-        "outtmpl": "downloaded_video.%(ext)s"
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url)
-        return ydl.prepare_filename(info)
-
-# -------------------- Audio Extraction --------------------
-def extract_audio(video_path):
-    tmp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp_audio_path = tmp_audio.name
-    tmp_audio.close()
+    # Hardware Detection & High-Quality Encoding Params
     try:
-        (
-            ffmpeg.input(video_path)
-            .output(tmp_audio_path, ac=1, ar=16000, vn=True, loglevel=LOGLEVEL)
-            .overwrite_output()
-            .run()
-        )
-    except ffmpeg.Error as e:
-        print("[!] FFmpeg audio extraction failed.")
-        if args.debug:
-            print(e.stderr.decode() if e.stderr else e)
-        sys.exit(1)
-    return tmp_audio_path
+        subprocess.check_output(['nvidia-smi'], stderr=subprocess.STDOUT)
+        device, compute_type = "cuda", "float16"
+        # NVENC HQ Settings: Variable Bitrate, CQ 19, Slow Preset
+        enc_params = {"vcodec": "h264_nvenc", "rc": "vbr", "cq": "19", "preset": "slow"}
+        console.print("[bold green]✔ NVIDIA GPU Detected.[/bold green] Using HQ Hardware Encoding.")
+    except:
+        device, compute_type = "cpu", "int8"
+        # CPU HQ Settings: CRF 18 (Visually Lossless), Slow Preset
+        enc_params = {"vcodec": "libx264", "crf": "18", "preset": "slow"}
+        console.print("[yellow]! No GPU detected.[/yellow] Using HQ CPU Encoding (Slow but High Quality).")
 
-# -------------------- Transcription and Word Detection --------------------
-def transcribe_and_find_matches(audio_path):
-    print("[*] Transcribing audio...")
-    model = WhisperModel(args.model, device=args.device)
-    segments, _ = model.transcribe(audio_path, beam_size=5)
-    matches = []
-    for seg in segments:
-        words = getattr(seg, "words", [])
-        for word in words:
-            if fuzz.ratio(word.word.lower(), args.word.lower()) > 80:
-                start = max(0, word.start - args.before)
-                end = word.end + args.after
-                matches.append((start, end))
-    return matches
-
-# -------------------- Video Cutting --------------------
-def cut_video(video_path, output_file, matches):
-    if not matches:
-        print("[*] No matches found. Exiting.")
+    def cleanup(sig, frame):
+        console.print("\n[bold red]✖ Interrupted. Cleaning up...[/bold red]")
         sys.exit(0)
 
-    print(f"[*] Cutting {len(matches)} segments...")
-    inputs = []
-    for i, (start, end) in enumerate(tqdm(matches, desc="Trimming clips")):
-        tmp_out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-        tmp_out_path = tmp_out.name
-        tmp_out.close()
-        try:
-            (
-                ffmpeg.input(video_path, ss=start, to=end)
-                .output(tmp_out_path, c="copy", loglevel=LOGLEVEL)
-                .overwrite_output()
-                .run()
-            )
-        except ffmpeg.Error as e:
-            print(f"[!] Failed to trim segment {i}")
-            if args.debug:
-                print(e.stderr.decode() if e.stderr else e)
-            continue
-        inputs.append(tmp_out_path)
+    signal.signal(signal.SIGINT, cleanup)
 
-    if not inputs:
-        print("[!] No clips created. Exiting.")
-        sys.exit(1)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # 1. Download
+        video_file = args.video
+        if args.video.startswith(("http", "www")):
+            console.print("[bold blue][*] Downloading Video...[/bold blue]")
+            ydl_opts = {
+                "format": "bestvideo+bestaudio/best",
+                "outtmpl": f"{tmp_dir}/in.%(ext)s",
+                "quiet": True,
+                "no_warnings": True,
+                "logger": QuietLogger() if not args.debug else None
+            }
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(args.video)
+                video_file = ydl.prepare_filename(info)
 
-    # Concatenate clips
-    concat_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
-    for clip in inputs:
-        concat_file.write(f"file '{os.path.abspath(clip)}'\n")
-    concat_file.flush()
-    concat_file_path = concat_file.name
-    concat_file.close()
+        # 2. Transcribe
+        model = WhisperModel(args.model, device=device, compute_type=compute_type)
+        segments, info = model.transcribe(video_file, word_timestamps=True)
 
-    print("[*] Merging clips...")
-    try:
+        matches = []
+        target = args.word.lower()
+
+        with tqdm(total=round(info.duration), unit="s", desc="[*] Analyzing Audio", disable=args.debug) as pbar:
+            last_t = 0
+            for seg in segments:
+                if seg.words:
+                    for w in seg.words:
+                        clean = re.sub(r'[^\w]', '', w.word).lower()
+                        if fuzz.ratio(clean, target) > 85:
+                            matches.append((max(0, w.start - args.before), min(info.duration, w.end + args.after)))
+                pbar.update(seg.end - last_t)
+                last_t = seg.end
+
+        if not matches:
+            console.print(f"[bold red]No occurrences of '{args.word}' found.[/bold red]")
+            return
+
+        # 3. Merge Intervals
+        matches.sort()
+        merged = []
+        if matches:
+            curr_s, curr_e = matches[0]
+            for next_s, next_e in matches[1:]:
+                if next_s <= curr_e: curr_e = max(curr_e, next_e)
+                else:
+                    merged.append((curr_s, curr_e))
+                    curr_s, curr_e = next_s, next_e
+            merged.append((curr_s, curr_e))
+
+        # Pretty Table
+        table = Table(title=f"Matches for '{args.word}'")
+        table.add_column("Match #", justify="right", style="cyan")
+        table.add_column("Timestamp", style="magenta")
+        table.add_column("Duration", justify="right")
+        for i, (s, e) in enumerate(merged):
+            table.add_row(str(i+1), f"{s:.2f}s - {e:.2f}s", f"{e-s:.2f}s")
+        console.print(table)
+
+        # 4. Parallel Cutting (HQ Re-encoding)
+        def cut_segment(data):
+            idx, start, end = data
+            out = os.path.join(tmp_dir, f"clip_{idx}.mp4")
+            try:
+                (
+                    ffmpeg.input(video_file, ss=start, to=end)
+                    .output(out, acodec="aac", pix_fmt="yuv420p", loglevel="error" if not args.debug else "info", **enc_params)
+                    .overwrite_output()
+                    .run(capture_stdout=True, capture_stderr=True)
+                )
+                return out
+            except: return None
+
+        console.print(f"[bold blue][*] Cutting {len(merged)} clips in High Quality...[/bold blue]")
+        tasks = [(i, m[0], m[1]) for i, m in enumerate(merged)]
+        with ThreadPoolExecutor(max_workers=args.threads) as exec:
+            clips = list(tqdm(exec.map(cut_segment, tasks), total=len(tasks), desc="[*] Rendering Clips", disable=args.debug))
+
+        # 5. Final Concat
+        clips = [c for c in clips if c]
+        list_file = os.path.join(tmp_dir, "list.txt")
+        with open(list_file, "w") as f:
+            for c in clips: f.write(f"file '{os.path.abspath(c)}'\n")
+
+        console.print("[bold blue][*] Merging Final Supercut...[/bold blue]")
         (
-            ffmpeg.input(concat_file_path, format="concat", safe=0)
-            .output(output_file, c="copy", loglevel=LOGLEVEL)
+            ffmpeg.input(list_file, format="concat", safe=0)
+            .output(args.output, c="copy", loglevel="error" if not args.debug else "info")
             .overwrite_output()
-            .run()
+            .run(capture_stdout=True, capture_stderr=True)
         )
-    except ffmpeg.Error as e:
-        print("[!] Failed to merge clips.")
-        if args.debug:
-            print(e.stderr.decode() if e.stderr else e)
+
+        console.print(f"\n[bold green]✔ SUCCESS![/bold green] High-quality supercut saved to: [bold underline]{args.output}[/bold underline]")
+
+if __name__ == "__main__":
+    VENV_PATH = Path("./wow_env")
+    if not shutil.which("ffmpeg"):
+        print("[!] FFmpeg not found. Please install it first.")
         sys.exit(1)
-
-    print(f"[*] Supercut saved to {output_file}")
-
-# -------------------- Main --------------------
-video_file = download_video(args.video)
-audio_file = extract_audio(video_file)
-matches = transcribe_and_find_matches(audio_file)
-cut_video(video_file, args.output, matches)
-
-# Cleanup
-os.unlink(audio_file)
+    create_venv(VENV_PATH)
+    main()
