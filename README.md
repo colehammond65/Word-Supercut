@@ -52,7 +52,7 @@ python wow_supercut_script.py <input> <output> --word <target> [options]
 | `--word` | The word or phrase to search for | (Required) |
 | `--before` | Seconds of footage to include *before* the word | `0.5` |
 | `--after` | Seconds of footage to include *after* the word | `0.5` |
-| `--model` | Whisper model size (`tiny`, `base`, `small`, `medium`, `large-v3`) | `small` |
+| `--model` | Whisper model size (`tiny`, `base`, `small`, `medium`, `large-v3`) | `medium` |
 | `--threads` | Number of parallel threads for video cutting | `CPU Count` |
 | `--debug` | Show technical logs, FFmpeg output, and yt-dlp warnings | `False` |
 
